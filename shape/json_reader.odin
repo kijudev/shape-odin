@@ -8,6 +8,10 @@ import "core:strings"
 
 MAX_JSON_INLINE_ARRAY :: 4
 
+JSON_READER_CAPACITY :: 4096
+JSON_READER_PRETTY :: false
+JSON_READER_TABSIZE: u8 : 4
+
 // JSON syntax reader that ouputs to a string. Nesting is carried by walk's recursion, the
 // reader only tracks the container it is currently inside. Map keys are always written as
 // strings, primitive keys get quoted.
@@ -23,9 +27,9 @@ Json_Reader :: struct {
 
 json_reader_init :: proc(
 	r: ^Json_Reader,
-	capacity := 4096,
-	pretty := false,
-	tabsize: u8 = 4,
+	capacity := JSON_READER_CAPACITY,
+	pretty := JSON_READER_PRETTY,
+	tabsize := JSON_READER_TABSIZE,
 	allocator := context.allocator,
 ) {
 	r.base = Visitor {
@@ -61,6 +65,23 @@ json_reader_reset :: proc(r: ^Json_Reader) {
 }
 
 json_reader_string :: proc(r: ^Json_Reader) -> string {return strings.to_string(r.builder)}
+
+// Serializes `value` in one call, the result is cloned with `allocator` before the reader is
+// destroyed.
+json_read :: proc(
+	value: ^$T,
+	capacity := JSON_READER_CAPACITY,
+	pretty := JSON_READER_PRETTY,
+	tabsize := JSON_READER_TABSIZE,
+	allocator := context.allocator,
+) -> string {
+	r: Json_Reader
+	json_reader_init(&r, capacity, pretty, tabsize, allocator)
+	defer json_reader_destroy(&r)
+
+	walk(&r, "", value, T)
+	return strings.clone(json_reader_string(&r), allocator)
+}
 
 // >-------------------------------------------------------------------- Actions
 

@@ -40,6 +40,7 @@ Visitor :: struct {
 		count: ^int,
 	) -> bool,
 	map_end:      proc(v: ^Visitor),
+
 	// UTF-8 strings and cstrings, `bytes` is the content to emit, or in .Write mode the
 	// freshly allocated `count` bytes to fill.
 	string_begin: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info, count: ^int) -> bool,
@@ -153,7 +154,12 @@ walk :: proc(v: ^Visitor, name: string, data: rawptr, tid: typeid, tag: reflect.
 				walk(v, "", raw_data(value), info.value.id)
 				v.map_value = false
 
-				runtime.__dynamic_map_set_without_hash(raw, info.map_info, raw_data(key), raw_data(value))
+				runtime.__dynamic_map_set_without_hash(
+					raw,
+					info.map_info,
+					raw_data(key),
+					raw_data(value),
+				)
 			}
 		} else {
 			it := 0

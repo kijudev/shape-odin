@@ -64,6 +64,22 @@ json_writer_reset :: proc(w: ^Json_Writer) {
 	w.err = .None
 }
 
+// Parses `src` into `value` in one call, `pos` is where parsing stopped.
+json_write :: proc(
+	value: ^$T,
+	src: string,
+	allocator := context.allocator,
+) -> (
+	err: Json_Writer_Error,
+	pos: int,
+) {
+	w: Json_Writer
+	json_writer_init(&w, src, allocator)
+
+	walk(&w, "", value, T)
+	return w.err, w.pos
+}
+
 // >-------------------------------------------------------------------- Actions
 
 json_writer_struct_begin :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) -> bool {

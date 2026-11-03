@@ -60,6 +60,22 @@ lisp_writer_reset :: proc(w: ^Lisp_Writer) {
 	w.err = .None
 }
 
+// Parses `src` into `value` in one call, `pos` is where parsing stopped.
+lisp_write :: proc(
+	value: ^$T,
+	src: string,
+	allocator := context.allocator,
+) -> (
+	err: Lisp_Writer_Error,
+	pos: int,
+) {
+	w: Lisp_Writer
+	lisp_writer_init(&w, src, allocator)
+
+	walk(&w, "", value, T)
+	return w.err, w.pos
+}
+
 // >-------------------------------------------------------------------- Actions
 
 lisp_writer_struct_begin :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) -> bool {

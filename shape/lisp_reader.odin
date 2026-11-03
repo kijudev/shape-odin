@@ -8,6 +8,10 @@ import "core:strings"
 
 MAX_LISP_INLINE_ARRAY :: 4
 
+LISP_READER_CAPACITY :: 4096
+LISP_READER_PRETTY :: false
+LISP_READER_TABSIZE: u8 : 4
+
 // S-expression syntax reader that ouputs to a string. Nesting is carried by walk's
 // recursion, the reader only tracks the container it is currently inside.
 Lisp_Reader :: struct {
@@ -22,9 +26,9 @@ Lisp_Reader :: struct {
 
 lisp_reader_init :: proc(
 	r: ^Lisp_Reader,
-	capacity := 4096,
-	pretty := false,
-	tabsize: u8 = 4,
+	capacity := LISP_READER_CAPACITY,
+	pretty := LISP_READER_PRETTY,
+	tabsize := LISP_READER_TABSIZE,
 	allocator := context.allocator,
 ) {
 	r.base = Visitor {
@@ -60,6 +64,23 @@ lisp_reader_reset :: proc(r: ^Lisp_Reader) {
 }
 
 lisp_reader_string :: proc(r: ^Lisp_Reader) -> string {return strings.to_string(r.builder)}
+
+// Serializes `value` in one call, the result is cloned with `allocator` before the reader is
+// destroyed.
+lisp_read :: proc(
+	value: ^$T,
+	capacity := LISP_READER_CAPACITY,
+	pretty := LISP_READER_PRETTY,
+	tabsize := LISP_READER_TABSIZE,
+	allocator := context.allocator,
+) -> string {
+	r: Lisp_Reader
+	lisp_reader_init(&r, capacity, pretty, tabsize, allocator)
+	defer lisp_reader_destroy(&r)
+
+	walk(&r, "", value, T)
+	return strings.clone(lisp_reader_string(&r), allocator)
+}
 
 // >-------------------------------------------------------------------- Actions
 
