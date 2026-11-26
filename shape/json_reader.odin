@@ -2,7 +2,6 @@ package shape
 
 import "base:runtime"
 import "core:math"
-import "core:reflect"
 import "core:strconv"
 import "core:unicode/utf16"
 import "core:unicode/utf8"
@@ -22,50 +21,31 @@ Json_Reader_Error :: enum u8 {
 	Parse_Array,
 	Parse_Map,
 	Parse_Union,
+	Parse_Null,
 	Out_Of_Range,
 }
 
-// JSON syntax reader that parses a string into the walked value. It consumes the source in
-// walk order, so struct fields must appear in declaration order. The first error sticks and
-// turns every later step into a no-op, `pos` is left at the point of failure.
+// Parses JSON into nodes, reading the format json_write produces. Struct fields must appear in
+// declaration order. The first error sticks and turns every later step into a no-op, `pos` is
+// left at the point of failure.
 Json_Reader :: struct {
-	using base: Visitor,
-	src:        string,
-	pos:        int,
-	depth:      int,
-	has_items:  bool,
-	err:        Json_Reader_Error,
+	src:       string,
+	pos:       int,
+	err:       Json_Reader_Error,
+	allocator: runtime.Allocator,
+
+	// Optional, called before every value, returning true means it read the value itself.
+	override:  proc(r: ^Json_Reader, n: Node) -> bool,
 }
 
 json_reader_init :: proc(r: ^Json_Reader, src: string, allocator := context.allocator) {
-	r.base = Visitor {
-		mode         = .Read,
-		struct_begin = json_reader_struct_begin,
-		struct_end   = json_reader_struct_end,
-		array_begin  = json_reader_array_begin,
-		array_end    = json_reader_array_end,
-		map_begin    = json_reader_map_begin,
-		map_end      = json_reader_map_end,
-		string_begin = json_reader_string_begin,
-		string_end   = json_reader_string_end,
-		primitive    = json_reader_primitive,
-		union_begin  = json_reader_union_begin,
-		union_end    = json_reader_union_end,
-		invalid      = json_reader_invalid,
-		allocator    = allocator,
-	}
-
 	r.src = src
-	r.pos = 0
-	r.depth = 0
-	r.has_items = false
-	r.err = .None
+	r.allocator = allocator
+	json_reader_reset(r)
 }
 
 json_reader_reset :: proc(r: ^Json_Reader) {
 	r.pos = 0
-	r.depth = 0
-	r.has_items = false
 	r.err = .None
 }
 
@@ -81,198 +61,227 @@ json_read :: proc(
 	r: Json_Reader
 	json_reader_init(&r, src, allocator)
 
-	walk(&r, "", value, T)
+	json_read_node(&r, node_of(value))
 	return r.err, r.pos
 }
 
-// >-------------------------------------------------------------------- Actions
+json_read_node :: proc(r: ^Json_Reader, n: Node) {
+	if r.err != .None do return
+	if r.override != nil && r.override(r, n) do return
 
-json_reader_struct_begin :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) -> bool {
-	r := (^Json_Reader)(v)
-	open(r, name, '{', .Parse_Struct)
-	return r.err == .None
-}
+	switch v in n.value {
+	case Struct:
+		expect(r, '{', .Parse_Struct)
+		first := true
+		it := 0
+		for f in iterate_fields(v, &it) {
+			if !first do expect(r, ',', .Parse_Separator)
+			first = false
 
-json_reader_struct_end :: proc(v: ^Visitor) {close((^Json_Reader)(v), '}', .Parse_Struct)}
+			if quoted(r, .Parse_Field) != f.name do fail(r, .Parse_Field)
+			expect(r, ':', .Parse_Separator)
+			json_read_node(r, f)
+			if r.err != .None do return
+		}
+		expect(r, '}', .Parse_Struct)
 
-json_reader_array_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	elem: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	r := (^Json_Reader)(v)
-	open(r, name, '[', .Parse_Array)
+	case Array:
+		if !expect(r, '[', .Parse_Array) do return
+		count := count_items(r)
 
-	items := count_items(r)
-	if fixed, ok := runtime.type_info_base(info).variant.(runtime.Type_Info_Array); ok {
-		if items != fixed.count do fail(r, .Parse_Array)
-	}
-
-	count^ = items
-	return r.err == .None
-}
-
-json_reader_array_end :: proc(v: ^Visitor) {close((^Json_Reader)(v), ']', .Parse_Array)}
-
-json_reader_map_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	key: ^runtime.Type_Info,
-	value: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	r := (^Json_Reader)(v)
-	open(r, name, '{', .Parse_Map)
-
-	count^ = count_items(r)
-	return r.err == .None
-}
-
-json_reader_map_end :: proc(v: ^Visitor) {close((^Json_Reader)(v), '}', .Parse_Map)}
-
-json_reader_string_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	r := (^Json_Reader)(v)
-	prefix(r, name)
-	if !expect(r, '"', .Parse_String) do return false
-
-	length, _, ok := decode_string(r.src, r.pos, nil)
-	if !ok do fail(r, .Parse_String)
-
-	count^ = length
-	return r.err == .None
-}
-
-json_reader_string_end :: proc(v: ^Visitor, bytes: []byte) {
-	r := (^Json_Reader)(v)
-	_, r.pos, _ = decode_string(r.src, r.pos, bytes)
-}
-
-json_reader_primitive :: proc(
-	v: ^Visitor,
-	name: string,
-	data: rawptr,
-	ti: ^runtime.Type_Info,
-	tag: reflect.Struct_Tag,
-) {
-	r := (^Json_Reader)(v)
-	// prefix clears the flag, a primitive map key arrives wrapped in quotes
-	key := r.map_key
-	prefix(r, name)
-
-	#partial switch info in runtime.type_info_base(ti).variant {
-	case runtime.Type_Info_Integer:
-		if info.signed {
-			store_signed(r, data, ti.size, parse_signed_int(r, key))
-		} else {
-			store_unsigned(r, data, ti.size, parse_unsigned_int(r, key))
+		fits := is_resizable(v) ? resize(v, count, r.allocator) : count == array_length(v)
+		if !fits {
+			fail(r, .Parse_Array)
+			return
 		}
 
-	case runtime.Type_Info_Float:
-		f := parse_float(r, key)
+		it: Elem_Iterator
+		for e in iterate_elems(v, &it) {
+			if e.index > 0 do expect(r, ',', .Parse_Separator)
+			json_read_node(r, e)
+			if r.err != .None do return
+		}
+		expect(r, ']', .Parse_Array)
+
+	case Bit_Set:
+		if !expect(r, '[', .Parse_Array) do return
+		count := count_items(r)
+		store_bits(v.data, int(v.size), 0)
+
+		for i in 0 ..< count {
+			if i > 0 do expect(r, ',', .Parse_Separator)
+
+			// Members come as values of the element type, read through a scratch value
+			scratch: u128
+			value := node_from(&scratch, v.elem)
+			json_read_node(r, value)
+			if r.err != .None do return
+
+			m := member(v, int(integer_of(value.value) - i128(v.lower)))
+			flag, ok := m.value.(Bool)
+			if !ok {
+				fail(r, .Out_Of_Range)
+				return
+			}
+			set_bool(flag, true)
+		}
+		expect(r, ']', .Parse_Array)
+
+	case Map:
+		if !expect(r, '{', .Parse_Map) do return
+		count := count_items(r)
+		map_reserve(v, count, r.allocator)
+
+		// Entries are read into scratch values and copied in, the map hashes the finished key
+		key_mem, _ := runtime.mem_alloc(v.key.size, v.key.align, r.allocator)
+		value_mem, _ := runtime.mem_alloc(v.value.size, v.value.align, r.allocator)
+		defer runtime.mem_free(raw_data(key_mem), r.allocator)
+		defer runtime.mem_free(raw_data(value_mem), r.allocator)
+
+		for i in 0 ..< count {
+			if i > 0 do expect(r, ',', .Parse_Separator)
+			runtime.mem_zero(raw_data(key_mem), len(key_mem))
+			runtime.mem_zero(raw_data(value_mem), len(value_mem))
+
+			key := node_from(raw_data(key_mem), v.key)
+			key.is_key = true
+			read_key(r, key)
+			expect(r, ':', .Parse_Separator)
+			json_read_node(r, node_from(raw_data(value_mem), v.value))
+			if r.err != .None do return
+
+			map_insert(v, raw_data(key_mem), raw_data(value_mem), r.allocator)
+		}
+		expect(r, '}', .Parse_Map)
+
+	case Union:
+		if !skip_ws(r) do return
+
+		if r.pos >= len(r.src) || r.src[r.pos] != '{' {
+			_, ok := set_variant(v, -1)
+			if token(r) != "null" || !ok do fail(r, .Parse_Union)
+			return
+		}
+
+		expect(r, '{', .Parse_Union)
+		key := quoted(r, .Parse_Union)
 		if r.err != .None do return
 
-		switch ti.size {
-		case 2:
-			(^f16)(data)^ = f16(f)
-		case 4:
-			(^f32)(data)^ = f32(f)
-		case 8:
-			(^f64)(data)^ = f
+		buffer: [128]byte
+		for i in 0 ..< len(v.variants) {
+			if variant_name(v, i, buffer[:]) != key do continue
+
+			payload, _ := set_variant(v, i)
+			expect(r, ':', .Parse_Separator)
+			json_read_node(r, payload)
+			expect(r, '}', .Parse_Union)
+			return
 		}
 
-	case runtime.Type_Info_Boolean:
-		store_unsigned(r, data, ti.size, parse_bool(r, key) ? 1 : 0)
+		fail(r, .Parse_Union)
 
-	case runtime.Type_Info_Enum:
-		val := parse_enum(r, info)
-		base := runtime.type_info_base(info.base)
+	case String:
+		if !expect(r, '"', .Parse_String) do return
 
-		if bi, ok := base.variant.(runtime.Type_Info_Integer); ok && bi.signed {
-			store_signed(r, data, base.size, val)
-		} else {
-			store_unsigned(r, data, base.size, u64(val))
-		}
-
-	case runtime.Type_Info_Rune:
-		// A string holding exactly one code point
-		if !expect(r, '"', .Parse_Rune) do return
-
-		buffer: [4]byte
 		length, _, ok := decode_string(r.src, r.pos, nil)
-		if !ok || length == 0 || length > len(buffer) {
-			fail(r, .Parse_Rune)
+		if !ok {
+			fail(r, .Parse_String)
 			return
 		}
 
-		_, r.pos, _ = decode_string(r.src, r.pos, buffer[:length])
-		value, n := utf8.decode_rune(buffer[:length])
-		// A lone RUNE_ERROR of width 1 is an invalid byte, an encoded U+FFFD is three wide
-		if n != length || (value == utf8.RUNE_ERROR && n == 1) {
-			fail(r, .Parse_Rune)
-			return
-		}
+		_, r.pos, _ = decode_string(r.src, r.pos, alloc_string(v, length, r.allocator))
 
-		(^rune)(data)^ = value
+	case Int, Float, Bool, Rune, Enum:
+		read_scalar(r, n.value, false)
 
-	case runtime.Type_Info_String:
-		// Only non UTF-8 strings land here, walk sends the rest to string_begin
-		if scalar(r, key, .Parse_String) != "null" do fail(r, .Parse_String)
+	case:
+		if token(r) != "null" do fail(r, .Parse_Null)
 	}
 }
 
-// Peeks the single key of `{"Circle": {...}}` to pick the variant, walk then consumes it as
-// the payload's name. `null` is a nil union.
-json_reader_union_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	variant: ^int,
-) -> bool {
-	r := (^Json_Reader)(v)
-	variant^ = -1
-	prefix(r, name)
-	if !skip_ws(r) do return false
+// >--------------------------------------------------------------------- Internals
 
-	union_info := runtime.type_info_base(info).variant.(runtime.Type_Info_Union)
-
-	if r.pos < len(r.src) && r.src[r.pos] != '{' {
-		if token(r) != "null" || union_info.no_nil do fail(r, .Parse_Union)
-		return false
+// A primitive map key arrives wrapped in quotes.
+@(private = "file")
+read_key :: proc(r: ^Json_Reader, key: Node) {
+	#partial switch _ in key.value {
+	case Int, Float, Bool, Rune, Enum:
+		read_scalar(r, key.value, true)
+	case:
+		json_read_node(r, key)
 	}
-
-	enter(r, '{', .Parse_Union)
-	start := r.pos
-	key := quoted(r, .Parse_Union)
-	r.pos = start
-	if r.err != .None do return false
-
-	buffer: [128]byte
-	for payload, i in union_info.variants {
-		if union_variant_name(payload, buffer[:]) == key {
-			variant^ = i
-			return true
-		}
-	}
-
-	fail(r, .Parse_Union)
-	return false
 }
 
-json_reader_union_end :: proc(v: ^Visitor) {close((^Json_Reader)(v), '}', .Parse_Union)}
+@(private = "file")
+read_scalar :: proc(r: ^Json_Reader, value: Value, key: bool) {
+	fits := true
 
-json_reader_invalid :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) {
-	fail((^Json_Reader)(v), .Out_Of_Range)
+	#partial switch v in value {
+	case Int:
+		parsed := v.signed ? parse_signed_int(r, key) : parse_unsigned_int(r, key)
+		fits = r.err != .None || set_int(v, parsed)
+
+	case Float:
+		f := parse_float(r, key)
+		if r.err == .None do set_float(v, f)
+
+	case Bool:
+		b := parse_bool(r, key)
+		if r.err == .None do set_bool(v, b)
+
+	case Enum:
+		parsed := parse_enum(r, v)
+		fits = r.err != .None || set_enum(v, parsed)
+
+	case Rune:
+		parsed := parse_rune(r)
+		fits = r.err != .None || set_rune(v, parsed)
+	}
+
+	if !fits do fail(r, .Out_Of_Range)
 }
 
-// >------------------------------------------------------------------ Utilities
+// Integer like values (bit set members) as one number.
+@(private = "file")
+integer_of :: proc(value: Value) -> i128 {
+	#partial switch v in value {
+	case Int:
+		return get_int(v)
+	case Enum:
+		return get_enum(v)
+	case Rune:
+		return i128(get_rune(v))
+	case Bool:
+		return get_bool(v) ? 1 : 0
+	}
+
+	return 0
+}
+
+// A string holding exactly one code point.
+@(private = "file")
+parse_rune :: proc(r: ^Json_Reader) -> rune {
+	if !expect(r, '"', .Parse_Rune) do return 0
+
+	buffer: [4]byte
+	length, _, ok := decode_string(r.src, r.pos, nil)
+	if !ok || length == 0 || length > len(buffer) {
+		fail(r, .Parse_Rune)
+		return 0
+	}
+
+	_, r.pos, _ = decode_string(r.src, r.pos, buffer[:length])
+	value, n := utf8.decode_rune(buffer[:length])
+
+	// A lone RUNE_ERROR of width 1 is an invalid byte, an encoded U+FFFD is three wide
+	if n != length || (value == utf8.RUNE_ERROR && n == 1) {
+		fail(r, .Parse_Rune)
+		return 0
+	}
+
+	return value
+}
+
 
 @(private = "file")
 fail :: proc(r: ^Json_Reader, err: Json_Reader_Error) {
@@ -383,67 +392,26 @@ count_items :: proc(r: ^Json_Reader) -> int {
 	return count
 }
 
-@(private = "file")
-prefix :: proc(r: ^Json_Reader, name: string) {
-	if r.depth == 0 do return
-
-	if r.map_value {
-		r.map_value = false
-		expect(r, ':', .Parse_Separator)
-		return
-	}
-
-	r.map_key = false
-
-	if r.has_items do expect(r, ',', .Parse_Separator)
-	r.has_items = true
-
-	if name == "" do return
-	if quoted(r, .Parse_Field) != name do fail(r, .Parse_Field)
-	expect(r, ':', .Parse_Separator)
-}
 
 @(private = "file")
-open :: proc(r: ^Json_Reader, name: string, opener: byte, err: Json_Reader_Error) {
-	prefix(r, name)
-	enter(r, opener, err)
-}
-
-// open without the prefix, for when it was already consumed.
-@(private = "file")
-enter :: proc(r: ^Json_Reader, opener: byte, err: Json_Reader_Error) {
-	expect(r, opener, err)
-
-	r.depth += 1
-	r.has_items = false
-}
-
-@(private = "file")
-close :: proc(r: ^Json_Reader, closer: byte, err: Json_Reader_Error) {
-	expect(r, closer, err)
-
-	r.depth -= 1
-	r.has_items = true
-}
-
-@(private = "file")
-parse_signed_int :: proc(r: ^Json_Reader, key: bool) -> i64 {
+parse_signed_int :: proc(r: ^Json_Reader, key: bool) -> i128 {
 	tok := scalar(r, key, .Parse_Signed_Int)
 	if r.err != .None do return 0
 
-	value, ok := strconv.parse_i64_of_base(tok, 10)
+	value, ok := strconv.parse_i128_of_base(tok, 10)
 	if !ok do fail(r, .Parse_Signed_Int)
 	return value
 }
 
+// Returned as the i128 with the same bits, which is what set_int expects for u128.
 @(private = "file")
-parse_unsigned_int :: proc(r: ^Json_Reader, key: bool) -> u64 {
+parse_unsigned_int :: proc(r: ^Json_Reader, key: bool) -> i128 {
 	tok := scalar(r, key, .Parse_Unsigned_Int)
 	if r.err != .None do return 0
 
-	value, ok := strconv.parse_u64_of_base(tok, 10)
+	value, ok := strconv.parse_u128_of_base(tok, 10)
 	if !ok do fail(r, .Parse_Unsigned_Int)
-	return value
+	return i128(value)
 }
 
 @(private = "file")
@@ -474,22 +442,19 @@ parse_bool :: proc(r: ^Json_Reader, key: bool) -> bool {
 // Enums are names in quotes, or bare integers when the value has no named member. As a map
 // key the integer is quoted too, so a quoted integer is accepted as well.
 @(private = "file")
-parse_enum :: proc(r: ^Json_Reader, info: runtime.Type_Info_Enum) -> i64 {
+parse_enum :: proc(r: ^Json_Reader, e: Enum) -> i128 {
 	if !skip_ws(r) do return 0
 
 	tok: string
 	if r.pos < len(r.src) && r.src[r.pos] == '"' {
 		tok = quoted(r, .Parse_Enum)
 		if r.err != .None do return 0
-
-		for name, i in info.names {
-			if name == tok do return i64(info.values[i])
-		}
+		if value, ok := enum_value(e, tok); ok do return value
 	} else {
 		tok = token(r)
 	}
 
-	value, ok := strconv.parse_i64_of_base(tok, 10)
+	value, ok := strconv.parse_i128_of_base(tok, 10)
 	if !ok do fail(r, .Parse_Enum)
 	return value
 }
@@ -570,44 +535,4 @@ decode_hex4 :: proc(src: string, i: ^int) -> (r: rune, ok: bool) {
 
 	i^ += 4
 	return rune(code), true
-}
-
-@(private = "file")
-store_unsigned :: proc(r: ^Json_Reader, data: rawptr, size: int, value: u64) {
-	if r.err != .None do return
-	if size < 8 && value >> uint(size * 8) != 0 {
-		fail(r, .Out_Of_Range)
-		return
-	}
-
-	switch size {
-	case 1:
-		(^u8)(data)^ = u8(value)
-	case 2:
-		(^u16)(data)^ = u16(value)
-	case 4:
-		(^u32)(data)^ = u32(value)
-	case 8:
-		(^u64)(data)^ = value
-	}
-}
-
-@(private = "file")
-store_signed :: proc(r: ^Json_Reader, data: rawptr, size: int, value: i64) {
-	if r.err != .None do return
-	if size < 8 && value >> uint(size * 8 - 1) != 0 && value >> uint(size * 8 - 1) != -1 {
-		fail(r, .Out_Of_Range)
-		return
-	}
-
-	switch size {
-	case 1:
-		(^i8)(data)^ = i8(value)
-	case 2:
-		(^i16)(data)^ = i16(value)
-	case 4:
-		(^i32)(data)^ = i32(value)
-	case 8:
-		(^i64)(data)^ = value
-	}
 }
