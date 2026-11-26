@@ -1,66 +1,125 @@
 package shape_tests
 
 import "../shape"
-import "core:math"
 import "core:testing"
 
 @(test)
-json_reader_compact :: proc(t: ^testing.T) {
+json_reader_parse :: proc(t: ^testing.T) {
 	Kind :: enum {
 		Box,
 		Capsule,
 	}
 	Thing :: struct {
-		id:    int,
+		id:    i32,
 		name:  string,
 		kind:  Kind,
-		alive: bool,
 		pos:   [2]f32,
+		tags:  []string,
+		count: map[int]u8,
 	}
 
-	thing := Thing{42, "a \"b\"\n", .Capsule, true, {1.5, -2}}
-	out := shape.json_read(&thing)
-	defer delete(out)
+	src := `{
+		"id": -3,
+		"name": "a \"b\"\né",
+		"kind": "Capsule",
+		"pos": [1.5, -2],
+		"tags": ["x", "y"],
+		"count": {"4": 9}
+	}`
 
-	testing.expect_value(
-		t,
-		out,
-		`{"id":42,"name":"a \"b\"\n","kind":"Capsule","alive":true,"pos":[1.5,-2]}`,
-	)
+	thing: Thing
+	err, pos := shape.json_read(&thing, src, context.temp_allocator)
+
+	testing.expect_value(t, err, shape.Json_Reader_Error.None)
+	testing.expect_value(t, pos, len(src))
+	testing.expect_value(t, thing.id, -3)
+	testing.expect_value(t, thing.name, "a \"b\"\né")
+	testing.expect_value(t, thing.kind, Kind.Capsule)
+	testing.expect_value(t, thing.pos, [2]f32{1.5, -2})
+	testing.expect_value(t, len(thing.tags), 2)
+	testing.expect_value(t, thing.tags[1], "y")
+	testing.expect_value(t, thing.count[4], 9)
 }
 
 @(test)
-json_reader_pretty :: proc(t: ^testing.T) {
+json_reader_roundtrip :: proc(t: ^testing.T) {
+	Kind :: enum {
+		Box,
+		Capsule,
+	}
 	Inner :: struct {
-		x: u8,
+		kind:  Kind,
+		scale: f64,
 	}
-	Outer :: struct {
+	Thing :: struct {
+		a:     int,
+		b:     bool,
+		c:     string,
 		inner: Inner,
-		pair:  [2]int,
+		list:  [dynamic]Inner,
+		empty: []int,
+		table: map[string][]u16,
 	}
 
-	outer := Outer{{7}, {1, 2}}
-	out := shape.json_read(&outer, pretty = true, tabsize = 2)
-	defer delete(out)
+	thing := Thing {
+		a     = -1,
+		b     = true,
+		c     = "tab\tquote\"",
+		inner = {.Capsule, 0.25},
+	}
+	append(&thing.list, Inner{.Box, 1}, Inner{.Capsule, -2.5})
+	defer delete(thing.list)
+	values := []u16{1, 65535}
+	thing.table["v"] = values
+	defer delete(thing.table)
 
-	testing.expect_value(t, out, "{\n  \"inner\": {\n    \"x\": 7\n  },\n  \"pair\": [1, 2]\n}")
+	for pretty in ([]bool{false, true}) {
+		out := shape.json_write(&thing, pretty = pretty)
+		defer delete(out)
+
+		back: Thing
+		err, pos := shape.json_read(&back, out, context.temp_allocator)
+
+		testing.expect_value(t, err, shape.Json_Reader_Error.None)
+		testing.expect_value(t, pos, len(out))
+		testing.expect_value(t, back.a, thing.a)
+		testing.expect_value(t, back.b, thing.b)
+		testing.expect_value(t, back.c, thing.c)
+		testing.expect_value(t, back.inner, thing.inner)
+		testing.expect_value(t, len(back.list), 2)
+		testing.expect_value(t, back.list[1], thing.list[1])
+		testing.expect_value(t, len(back.empty), 0)
+		testing.expect_value(t, len(back.table), 1)
+		testing.expect_value(t, len(back.table["v"]), 2)
+		testing.expect_value(t, back.table["v"][1], 65535)
+	}
 }
 
 @(test)
-json_reader_map_keys_and_nan :: proc(t: ^testing.T) {
-	Holder :: struct {
-		m: map[int]bool,
-		f: f32,
+json_reader_errors :: proc(t: ^testing.T) {
+	Small :: struct {
+		a: u8,
+		b: u8,
+	}
+	Fixed :: struct {
+		v: [3]int,
 	}
 
-	holder := Holder {
-		f = math.inf_f32(1),
-	}
-	holder.m[5] = true
-	defer delete(holder.m)
+	small: Small
+	fixed: Fixed
 
-	out := shape.json_read(&holder)
-	defer delete(out)
+	err, _ := shape.json_read(&small, `{"b":1,"a":2}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Field)
 
-	testing.expect_value(t, out, `{"m":{"5":true},"f":null}`)
+	err, _ = shape.json_read(&small, `{"a":1 "b":2}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Separator)
+
+	err, _ = shape.json_read(&small, `{"a":256,"b":0}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Out_Of_Range)
+
+	err, _ = shape.json_read(&small, `{"a":true,"b":0}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Unsigned_Int)
+
+	err, _ = shape.json_read(&fixed, `{"v":[1,2]}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Array)
 }

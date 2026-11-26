@@ -2,7 +2,7 @@
 
 ## JSON notation
 
-The `shape` walk can read and write JSON through `Json_Reader` and `Json_Writer`. The mapping:
+The `shape` walk can read and write JSON through `Json_Writer` and `Json_Reader`. The mapping:
 
 - structs are objects, fields must appear in declaration order when deserializing
 - arrays, slices and dynamic arrays are arrays

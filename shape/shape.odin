@@ -19,7 +19,7 @@ Visitor :: struct {
 	map_key:      bool,
 	map_value:    bool,
 
-	// Actions, `count` is filled by walk, in .Write mode the visitor replaces it with the
+	// Actions, `count` is filled by walk, in .Read mode the visitor replaces it with the
 	// length found in the source and walk allocates the container. `info` is the declared (possibly named) type, use type_info_base for its layout.
 	struct_begin: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) -> bool,
 	struct_end:   proc(v: ^Visitor),
@@ -41,7 +41,7 @@ Visitor :: struct {
 	) -> bool,
 	map_end:      proc(v: ^Visitor),
 
-	// UTF-8 strings and cstrings, `bytes` is the content to emit, or in .Write mode the
+	// UTF-8 strings and cstrings, `bytes` is the content to emit, or in .Read mode the
 	// freshly allocated `count` bytes to fill.
 	string_begin: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info, count: ^int) -> bool,
 	string_end:   proc(v: ^Visitor, bytes: []byte),
@@ -100,7 +100,7 @@ walk :: proc(v: ^Visitor, name: string, data: rawptr, tid: typeid, tag: reflect.
 		count := raw.len
 		if !v.array_begin(v, name, ti, info.elem, &count) do return
 
-		if v.mode == .Write {
+		if v.mode == .Read {
 			raw.data = alloc_elems(v, info.elem, info.elem_size, count)
 			raw.len = count
 		}
@@ -116,7 +116,7 @@ walk :: proc(v: ^Visitor, name: string, data: rawptr, tid: typeid, tag: reflect.
 		count := raw.len
 		if !v.array_begin(v, name, ti, info.elem, &count) do return
 
-		if v.mode == .Write {
+		if v.mode == .Read {
 			raw.data = alloc_elems(v, info.elem, info.elem_size, count)
 			raw.len = count
 			raw.cap = count
@@ -134,7 +134,7 @@ walk :: proc(v: ^Visitor, name: string, data: rawptr, tid: typeid, tag: reflect.
 		count := runtime.map_len(raw^)
 		if !v.map_begin(v, name, ti, info.key, info.value, &count) do return
 
-		if v.mode == .Write {
+		if v.mode == .Read {
 			raw.allocator = v.allocator
 			_ = runtime.map_reserve_dynamic(raw, info.map_info, uintptr(count))
 
@@ -186,7 +186,7 @@ walk :: proc(v: ^Visitor, name: string, data: rawptr, tid: typeid, tag: reflect.
 		count := len(bytes)
 		if !v.string_begin(v, name, ti, &count) do return
 
-		if v.mode == .Write {
+		if v.mode == .Read {
 			if info.is_cstring {
 				// One extra zeroed byte for the terminator
 				mem, _ := runtime.mem_alloc(count + 1, 1, v.allocator)

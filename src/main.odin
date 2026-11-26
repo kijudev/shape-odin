@@ -64,20 +64,20 @@ main :: proc() {
 }
 
 json_roundtrip :: proc(entity: ^Entity) {
-	reader: shape.Json_Reader
-	shape.json_reader_init(&reader, 64 * 1024, pretty = true, tabsize = 4)
+	writer: shape.Json_Writer
+	shape.json_writer_init(&writer, 64 * 1024, pretty = true, tabsize = 4)
 
-	shape.walk(&reader, "entity", entity, Entity)
-	serialized := shape.json_reader_string(&reader)
+	shape.walk(&writer, "entity", entity, Entity)
+	serialized := shape.json_writer_string(&writer)
 	fmt.println("JSON serialized:", serialized)
 
 	deserialized: Entity
-	writer: shape.Json_Writer
-	shape.json_writer_init(&writer, serialized)
-	shape.walk(&writer, "entity", &deserialized, Entity)
+	reader: shape.Json_Reader
+	shape.json_reader_init(&reader, serialized)
+	shape.walk(&reader, "entity", &deserialized, Entity)
 
-	if writer.err != .None {
-		fmt.println("JSON deserialization failed:", writer.err, "at", writer.pos)
+	if reader.err != .None {
+		fmt.println("JSON deserialization failed:", reader.err, "at", reader.pos)
 		return
 	}
 
