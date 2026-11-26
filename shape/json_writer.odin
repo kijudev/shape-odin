@@ -1,8 +1,6 @@
 package shape
 
-import "base:runtime"
 import "core:math"
-import "core:reflect"
 import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
@@ -13,17 +11,24 @@ JSON_WRITER_CAPACITY :: 4096
 JSON_WRITER_PRETTY :: false
 JSON_WRITER_TABSIZE: u8 : 4
 
-// JSON syntax writer that ouputs to a string. Nesting is carried by walk's recursion, the
-// writer only tracks the container it is currently inside. Map keys are always written as
-// strings, primitive keys get quoted.
+// Writes nodes as JSON into a string.
+//
+// - structs and bit_fields are objects, fields in declaration order
+// - arrays are arrays, enumerated arrays included
+// - maps are objects, primitive keys are stringified (`{"Capsule": ..., "42": ...}`)
+// - bit sets are arrays of their members
+// - unions are an object with a single key naming the variant, nil is `null`
+// - enums are their member name, or an integer when the value has no named member
+// - runes are one character strings
+// - NaN and infinite floats, and unsupported types, are `null`
 Json_Writer :: struct {
-	using base: Visitor,
-	builder:    strings.Builder,
-	pretty:     bool,
-	tabsize:    u8,
-	depth:      int,
-	has_items:  bool,
-	inline:     bool,
+	builder:  strings.Builder,
+	pretty:   bool,
+	tabsize:  u8,
+	depth:    int,
+
+	// Optional, called before every value, returning true means it wrote the value itself.
+	override: proc(w: ^Json_Writer, n: Node) -> bool,
 }
 
 json_writer_init :: proc(
@@ -33,28 +38,9 @@ json_writer_init :: proc(
 	tabsize := JSON_WRITER_TABSIZE,
 	allocator := context.allocator,
 ) {
-	w.base = Visitor {
-		mode         = .Write,
-		struct_begin = json_writer_struct_begin,
-		struct_end   = json_writer_struct_end,
-		array_begin  = json_writer_array_begin,
-		array_end    = json_writer_array_end,
-		map_begin    = json_writer_map_begin,
-		map_end      = json_writer_map_end,
-		string_begin = json_writer_string_begin,
-		string_end   = json_writer_string_end,
-		primitive    = json_writer_primitive,
-		union_begin  = json_writer_union_begin,
-		union_end    = json_writer_union_end,
-		allocator    = allocator,
-	}
-
 	w.pretty = pretty
 	w.tabsize = tabsize
 	w.depth = 0
-	w.has_items = false
-	w.inline = false
-
 	strings.builder_init(&w.builder, 0, capacity, allocator)
 }
 
@@ -63,8 +49,6 @@ json_writer_destroy :: proc(w: ^Json_Writer) {strings.builder_destroy(&w.builder
 json_writer_reset :: proc(w: ^Json_Writer) {
 	strings.builder_reset(&w.builder)
 	w.depth = 0
-	w.has_items = false
-	w.inline = false
 }
 
 json_writer_string :: proc(w: ^Json_Writer) -> string {return strings.to_string(w.builder)}
@@ -82,167 +66,158 @@ json_write :: proc(
 	json_writer_init(&w, capacity, pretty, tabsize, allocator)
 	defer json_writer_destroy(&w)
 
-	walk(&w, "", value, T)
+	json_write_node(&w, node_of(value))
 	return strings.clone(json_writer_string(&w), allocator)
 }
 
-// >-------------------------------------------------------------------- Actions
+json_write_node :: proc(w: ^Json_Writer, n: Node) {
+	if w.override != nil && w.override(w, n) do return
 
-json_writer_struct_begin :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) -> bool {
-	open((^Json_Writer)(v), name, '{')
-	return true
+	switch n.kind {
+	case .Struct:
+		first := true
+		open(w, '{')
+		it := 0
+		for f in iterate_fields(n, &it) {
+			item(w, &first, false)
+			write_name(w, f.name)
+			json_write_node(w, f)
+		}
+		close(w, '}', first, false)
+
+	case .Array:
+		count := length(n)
+		inline := count <= MAX_JSON_INLINE_ARRAY && count > 0 && is_primitive(elem(n, 0).kind)
+
+		first := true
+		open(w, '[')
+		for i in 0 ..< count {
+			item(w, &first, inline)
+			json_write_node(w, elem(n, i))
+		}
+		close(w, ']', first, inline)
+
+	case .Bit_Set:
+		bits := load_bits(n.data, n.info.size)
+		inline := count_ones(bits) <= MAX_JSON_INLINE_ARRAY
+		elem_info, lower := bit_set_elem(n)
+
+		first := true
+		open(w, '[')
+		for rest := bits; rest != 0; rest &= rest - 1 {
+			item(w, &first, inline)
+			// Members go out as values of the element type, so enums get their names
+			member := u128(lower + i128(lowest_one(rest)))
+			json_write_node(w, node_from(&member, elem_info))
+		}
+		close(w, ']', first, inline)
+
+	case .Map:
+		first := true
+		open(w, '{')
+		it := 0
+		for key, value in iterate_map(n, &it) {
+			item(w, &first, false)
+			write_key(w, key)
+			strings.write_string(&w.builder, w.pretty ? ": " : ":")
+			json_write_node(w, value)
+		}
+		close(w, '}', first, false)
+
+	case .Union:
+		index, payload := variant(n)
+		if index < 0 {
+			strings.write_string(&w.builder, "null")
+			return
+		}
+
+		buffer: [128]byte
+		first := true
+		open(w, '{')
+		item(w, &first, false)
+		write_name(w, variant_name(n, index, buffer[:]))
+		json_write_node(w, payload)
+		close(w, '}', first, false)
+
+	case .String:
+		write_quoted(w, get_string(n))
+
+	case .Int, .Float, .Bool, .Rune, .Enum:
+		write_scalar(w, n, false)
+
+	case .Invalid:
+		strings.write_string(&w.builder, "null")
+	}
 }
 
-json_writer_struct_end :: proc(v: ^Visitor) {close((^Json_Writer)(v), '}')}
+// >--------------------------------------------------------------------- Internals
 
-json_writer_array_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	elem: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	w := (^Json_Writer)(v)
-	open(w, name, '[')
-	w.inline = count^ <= MAX_JSON_INLINE_ARRAY && is_primitive(elem)
-	return true
+// Object keys must be strings in JSON, so a primitive map key is wrapped in quotes.
+@(private = "file")
+write_key :: proc(w: ^Json_Writer, key: Node) {
+	#partial switch key.kind {
+	case .Int, .Float, .Bool, .Rune, .Enum:
+		write_scalar(w, key, true)
+	case:
+		json_write_node(w, key)
+	}
 }
 
-json_writer_array_end :: proc(v: ^Visitor) {close((^Json_Writer)(v), ']')}
-
-json_writer_map_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	key: ^runtime.Type_Info,
-	value: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	open((^Json_Writer)(v), name, '{')
-	return true
-}
-
-json_writer_map_end :: proc(v: ^Visitor) {close((^Json_Writer)(v), '}')}
-
-json_writer_string_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	count: ^int,
-) -> bool {
-	prefix((^Json_Writer)(v), name)
-	return true
-}
-
-json_writer_string_end :: proc(v: ^Visitor, bytes: []byte) {
-	write_quoted((^Json_Writer)(v), string(bytes))
-}
-
-json_writer_primitive :: proc(
-	v: ^Visitor,
-	name: string,
-	data: rawptr,
-	ti: ^runtime.Type_Info,
-	tag: reflect.Struct_Tag,
-) {
-	w := (^Json_Writer)(v)
-	// prefix clears the flag, enums are quoted on their own
-	key := w.map_key
-	prefix(w, name)
+@(private = "file")
+write_scalar :: proc(w: ^Json_Writer, n: Node, key: bool) {
 	buffer: [64]byte
 
-	#partial switch info in runtime.type_info_base(ti).variant {
-	case runtime.Type_Info_Integer:
-		s :=
-			info.signed ? strconv.write_int(buffer[:], read_signed(data, ti.size), 10) : strconv.write_uint(buffer[:], read_unsigned(data, ti.size), 10)
-		write_key_aware(w, s, key)
+	#partial switch n.kind {
+	case .Int:
+		write_key_aware(w, format_int(buffer[:], get_int(n), n.signed), key)
 
-	case runtime.Type_Info_Float:
-		f: f64
-
-		switch ti.size {
-		case 2:
-			f = f64((^f16)(data)^)
-		case 4:
-			f = f64((^f32)(data)^)
-		case 8:
-			f = (^f64)(data)^
-		}
+	case .Float:
+		f := get_float(n)
 
 		if math.is_nan(f) || math.is_inf(f) {
 			write_key_aware(w, "null", key)
 		} else {
-			s := strconv.write_float(buffer[:], f, 'g', -1, ti.size * 8)
+			s := strconv.write_float(buffer[:], f, 'g', -1, n.info.size * 8)
 			write_key_aware(w, strings.trim_prefix(s, "+"), key)
 		}
 
-	case runtime.Type_Info_Boolean:
-		write_key_aware(w, read_unsigned(data, ti.size) != 0 ? "true" : "false", key)
+	case .Bool:
+		write_key_aware(w, get_bool(n) ? "true" : "false", key)
 
-	case runtime.Type_Info_Enum:
-		base := runtime.type_info_base(info.base)
-		val: i64
-
-		if bi, ok := base.variant.(runtime.Type_Info_Integer); ok && bi.signed {
-			val = read_signed(data, base.size)
+	case .Enum:
+		value := get_int(n)
+		if name, ok := enum_name(n.info, value); ok {
+			write_quoted(w, name)
 		} else {
-			val = i64(read_unsigned(data, base.size))
+			write_key_aware(w, format_int(buffer[:], value, n.signed), key)
 		}
 
-		for ev, i in info.values {
-			if i64(ev) == val {
-				write_quoted(w, info.names[i])
-				return
-			}
-		}
-
-		write_key_aware(w, strconv.write_int(buffer[:], val, 10), key)
-
-	case runtime.Type_Info_Rune:
-		bytes, n := utf8.encode_rune((^rune)(data)^)
-		write_quoted(w, string(bytes[:n]))
-
-	case runtime.Type_Info_String:
-		// Only non UTF-8 strings land here, walk sends the rest to string_begin
-		write_key_aware(w, "null", key)
+	case .Rune:
+		bytes, length := utf8.encode_rune(rune(get_int(n)))
+		write_quoted(w, string(bytes[:length]))
 	}
 }
 
-// Unions are an object with a single key naming the variant, `{"Circle": {...}}`, nil is
-// `null`.
-json_writer_union_begin :: proc(
-	v: ^Visitor,
-	name: string,
-	info: ^runtime.Type_Info,
-	variant: ^int,
-) -> bool {
-	w := (^Json_Writer)(v)
+@(private = "file")
+format_int :: proc(buffer: []byte, value: i128, signed: bool) -> string {
+	if !signed || value >= 0 do return strconv.write_u128(buffer, u128(value), 10)
 
-	if variant^ < 0 {
-		prefix(w, name)
-		strings.write_string(&w.builder, "null")
-		return false
-	}
-
-	open(w, name, '{')
-	return true
+	// Negating the minimum wraps to itself, which as u128 is still the right magnitude
+	buffer[0] = '-'
+	return string(buffer[:len(strconv.write_u128(buffer[1:], u128(-value), 10)) + 1])
 }
 
-json_writer_union_end :: proc(v: ^Visitor) {close((^Json_Writer)(v), '}')}
-
-json_writer_write_string :: proc(w: ^Json_Writer, name: string, s: string) {
-	prefix(w, name)
-	write_quoted(w, s)
-}
-
-// >------------------------------------------------------------------ Internals
-
-// Object keys must be strings in JSON, so a primitive map key is wrapped in quotes.
 @(private = "file")
 write_key_aware :: proc(w: ^Json_Writer, s: string, key: bool) {
 	if key do strings.write_byte(&w.builder, '"')
 	strings.write_string(&w.builder, s)
 	if key do strings.write_byte(&w.builder, '"')
+}
+
+@(private = "file")
+write_name :: proc(w: ^Json_Writer, name: string) {
+	write_quoted(w, name)
+	strings.write_string(&w.builder, w.pretty ? ": " : ":")
 }
 
 @(private = "file")
@@ -290,97 +265,36 @@ newline :: proc(w: ^Json_Writer) {
 }
 
 @(private = "file")
-prefix :: proc(w: ^Json_Writer, name: string) {
-	if w.depth == 0 do return
-
-	// A map value follows its key after a colon, like a struct field after its name
-	if w.map_value {
-		w.map_value = false
-		strings.write_string(&w.builder, w.pretty ? ": " : ":")
-		return
-	}
-
-	w.map_key = false
-
-	if w.has_items {
-		strings.write_byte(&w.builder, ',')
-		if w.pretty && w.inline do strings.write_byte(&w.builder, ' ')
-	}
-	w.has_items = true
-
-	if !w.inline do newline(w)
-
-	if name != "" {
-		write_quoted(w, name)
-		strings.write_string(&w.builder, w.pretty ? ": " : ":")
-	}
-}
-
-@(private = "file")
-open :: proc(w: ^Json_Writer, name: string, opener: byte) {
-	prefix(w, name)
+open :: proc(w: ^Json_Writer, opener: byte) {
 	strings.write_byte(&w.builder, opener)
-
 	w.depth += 1
-	w.has_items = false
-	w.inline = false
+}
+
+// Separates an item from the previous one and indents it, inline items share a line.
+@(private = "file")
+item :: proc(w: ^Json_Writer, first: ^bool, inline: bool) {
+	if !first^ {
+		strings.write_byte(&w.builder, ',')
+		if w.pretty && inline do strings.write_byte(&w.builder, ' ')
+	}
+	first^ = false
+
+	if !inline do newline(w)
 }
 
 @(private = "file")
-close :: proc(w: ^Json_Writer, closer: byte) {
+close :: proc(w: ^Json_Writer, closer: byte, first: bool, inline: bool) {
 	w.depth -= 1
-	if w.has_items && !w.inline do newline(w)
+	if !first && !inline do newline(w)
 	strings.write_byte(&w.builder, closer)
-
-	w.has_items = true
-	w.inline = false
 }
 
 @(private = "file")
-is_primitive :: proc(ti: ^runtime.Type_Info) -> bool {
-	#partial switch _ in runtime.type_info_base(ti).variant {
-	case runtime.Type_Info_Struct,
-	     runtime.Type_Info_Array,
-	     runtime.Type_Info_Slice,
-	     runtime.Type_Info_Dynamic_Array,
-	     runtime.Type_Info_Map,
-	     runtime.Type_Info_Bit_Set,
-	     runtime.Type_Info_Bit_Field,
-	     runtime.Type_Info_Union:
+is_primitive :: proc(kind: Kind) -> bool {
+	#partial switch kind {
+	case .Struct, .Array, .Map, .Bit_Set, .Union:
 		return false
 	}
 
 	return true
-}
-
-@(private = "file")
-read_unsigned :: proc(data: rawptr, size: int) -> u64 {
-	switch size {
-	case 1:
-		return u64((^u8)(data)^)
-	case 2:
-		return u64((^u16)(data)^)
-	case 4:
-		return u64((^u32)(data)^)
-	case 8:
-		return (^u64)(data)^
-	}
-
-	return 0
-}
-
-@(private = "file")
-read_signed :: proc(data: rawptr, size: int) -> i64 {
-	switch size {
-	case 1:
-		return i64((^i8)(data)^)
-	case 2:
-		return i64((^i16)(data)^)
-	case 4:
-		return i64((^i32)(data)^)
-	case 8:
-		return (^i64)(data)^
-	}
-
-	return 0
 }
