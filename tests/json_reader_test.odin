@@ -2,6 +2,7 @@ package shape_tests
 
 import "../shape"
 import "core:testing"
+import "core:unicode/utf8"
 
 @(test)
 json_reader_parse :: proc(t: ^testing.T) {
@@ -122,4 +123,155 @@ json_reader_errors :: proc(t: ^testing.T) {
 
 	err, _ = shape.json_read(&fixed, `{"v":[1,2]}`, context.temp_allocator)
 	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Array)
+}
+
+@(test)
+json_reader_bits_and_unions :: proc(t: ^testing.T) {
+	Kind :: enum u8 {
+		Box,
+		Sphere,
+		Capsule,
+	}
+	Circle :: struct {
+		r: f32,
+	}
+	Shape :: union {
+		Circle,
+		[]string,
+	}
+	Strict :: union #no_nil {
+		int,
+		bool,
+	}
+	Flags :: bit_field u16 {
+		level: u8   | 4,
+		delta: i8   | 4,
+		kind:  Kind | 2,
+		on:    bool | 1,
+	}
+	Thing :: struct {
+		kinds:  bit_set[Kind; u8],
+		digits: bit_set[-2 ..= 70],
+		chars:  bit_set['a' ..= 'z'],
+		flags:  Flags,
+		a:      Shape,
+		b:      Shape,
+		c:      Shape,
+		d:      Strict,
+		shapes: map[string]Shape,
+	}
+
+	thing := Thing {
+		kinds  = {.Sphere},
+		digits = {-2, 0, 70},
+		chars  = {'a', 'z'},
+		flags  = {level = 9, delta = -8, kind = .Capsule, on = false},
+		a      = Circle{2},
+		b      = []string{"x"},
+		d      = false,
+	}
+	thing.shapes["round"] = Circle{1}
+	thing.shapes["none"] = nil
+	defer delete(thing.shapes)
+
+	for pretty in ([]bool{false, true}) {
+		out := shape.json_write(&thing, pretty = pretty)
+		defer delete(out)
+
+		back: Thing
+		err, pos := shape.json_read(&back, out, context.temp_allocator)
+
+		testing.expect_value(t, err, shape.Json_Reader_Error.None)
+		testing.expect_value(t, pos, len(out))
+		testing.expect_value(t, back.kinds, thing.kinds)
+		testing.expect_value(t, back.digits, thing.digits)
+		testing.expect_value(t, back.chars, thing.chars)
+		testing.expect_value(t, back.flags, thing.flags)
+		testing.expect_value(t, back.a.(Circle), Circle{2})
+		testing.expect_value(t, back.b.([]string)[0], "x")
+		testing.expect(t, back.c == nil)
+		testing.expect_value(t, back.d.(bool), false)
+		testing.expect_value(t, len(back.shapes), 2)
+		testing.expect_value(t, back.shapes["round"].(Circle), Circle{1})
+		testing.expect(t, back.shapes["none"] == nil)
+	}
+}
+
+@(test)
+json_reader_bits_and_unions_errors :: proc(t: ^testing.T) {
+	Kind :: enum {
+		Box,
+		Capsule,
+	}
+	Bits :: struct {
+		digits: bit_set[0 ..< 4],
+	}
+	Flags :: bit_field u8 {
+		level: u8 | 3,
+		delta: i8 | 3,
+	}
+	Packed :: struct {
+		flags: Flags,
+	}
+	Shape :: union {
+		int,
+		Kind,
+	}
+	Strict :: union #no_nil {
+		int,
+		bool,
+	}
+	Holder :: struct {
+		s: Shape,
+	}
+	Strict_Holder :: struct {
+		s: Strict,
+	}
+	Letter :: struct {
+		c: rune,
+	}
+
+	bits: Bits
+	packed: Packed
+	holder: Holder
+	strict: Strict_Holder
+	letter: Letter
+
+	err, _ := shape.json_read(&bits, `{"digits":[1,4]}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Out_Of_Range)
+
+	err, _ = shape.json_read(&packed, `{"flags":{"level":8,"delta":0}}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Out_Of_Range)
+
+	err, _ = shape.json_read(&packed, `{"flags":{"level":0,"delta":-5}}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Out_Of_Range)
+
+	err, _ = shape.json_read(&packed, `{"flags":{"level":7,"delta":-4}}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.None)
+	testing.expect_value(t, packed.flags.level, 7)
+	testing.expect_value(t, packed.flags.delta, -4)
+
+	err, _ = shape.json_read(&holder, `{"s":{"Kind":"Capsule"}}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.None)
+	testing.expect_value(t, holder.s.(Kind), Kind.Capsule)
+
+	err, _ = shape.json_read(&holder, `{"s":{"f32":1}}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Union)
+
+	err, _ = shape.json_read(&holder, `{"s":5}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Union)
+
+	err, _ = shape.json_read(&strict, `{"s":null}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Union)
+
+	err, _ = shape.json_read(&letter, `{"c":"ab"}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.Parse_Rune)
+
+	err, _ = shape.json_read(&letter, `{"c":"é"}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.None)
+	testing.expect_value(t, letter.c, 'é')
+
+	err, _ = shape.json_read(&letter, `{"c":"\ufffd"}`, context.temp_allocator)
+	testing.expect_value(t, err, shape.Json_Reader_Error.None)
+	testing.expect_value(t, letter.c, utf8.RUNE_ERROR)
 }

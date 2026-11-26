@@ -16,10 +16,12 @@ Json_Reader_Error :: enum u8 {
 	Parse_Float,
 	Parse_Bool,
 	Parse_Enum,
+	Parse_Rune,
 	Parse_String,
 	Parse_Struct,
 	Parse_Array,
 	Parse_Map,
+	Parse_Union,
 	Out_Of_Range,
 }
 
@@ -47,6 +49,9 @@ json_reader_init :: proc(r: ^Json_Reader, src: string, allocator := context.allo
 		string_begin = json_reader_string_begin,
 		string_end   = json_reader_string_end,
 		primitive    = json_reader_primitive,
+		union_begin  = json_reader_union_begin,
+		union_end    = json_reader_union_end,
+		invalid      = json_reader_invalid,
 		allocator    = allocator,
 	}
 
@@ -196,10 +201,75 @@ json_reader_primitive :: proc(
 			store_unsigned(r, data, base.size, u64(val))
 		}
 
+	case runtime.Type_Info_Rune:
+		// A string holding exactly one code point
+		if !expect(r, '"', .Parse_Rune) do return
+
+		buffer: [4]byte
+		length, _, ok := decode_string(r.src, r.pos, nil)
+		if !ok || length == 0 || length > len(buffer) {
+			fail(r, .Parse_Rune)
+			return
+		}
+
+		_, r.pos, _ = decode_string(r.src, r.pos, buffer[:length])
+		value, n := utf8.decode_rune(buffer[:length])
+		// A lone RUNE_ERROR of width 1 is an invalid byte, an encoded U+FFFD is three wide
+		if n != length || (value == utf8.RUNE_ERROR && n == 1) {
+			fail(r, .Parse_Rune)
+			return
+		}
+
+		(^rune)(data)^ = value
+
 	case runtime.Type_Info_String:
 		// Only non UTF-8 strings land here, walk sends the rest to string_begin
 		if scalar(r, key, .Parse_String) != "null" do fail(r, .Parse_String)
 	}
+}
+
+// Peeks the single key of `{"Circle": {...}}` to pick the variant, walk then consumes it as
+// the payload's name. `null` is a nil union.
+json_reader_union_begin :: proc(
+	v: ^Visitor,
+	name: string,
+	info: ^runtime.Type_Info,
+	variant: ^int,
+) -> bool {
+	r := (^Json_Reader)(v)
+	variant^ = -1
+	prefix(r, name)
+	if !skip_ws(r) do return false
+
+	union_info := runtime.type_info_base(info).variant.(runtime.Type_Info_Union)
+
+	if r.pos < len(r.src) && r.src[r.pos] != '{' {
+		if token(r) != "null" || union_info.no_nil do fail(r, .Parse_Union)
+		return false
+	}
+
+	enter(r, '{', .Parse_Union)
+	start := r.pos
+	key := quoted(r, .Parse_Union)
+	r.pos = start
+	if r.err != .None do return false
+
+	buffer: [128]byte
+	for payload, i in union_info.variants {
+		if union_variant_name(payload, buffer[:]) == key {
+			variant^ = i
+			return true
+		}
+	}
+
+	fail(r, .Parse_Union)
+	return false
+}
+
+json_reader_union_end :: proc(v: ^Visitor) {close((^Json_Reader)(v), '}', .Parse_Union)}
+
+json_reader_invalid :: proc(v: ^Visitor, name: string, info: ^runtime.Type_Info) {
+	fail((^Json_Reader)(v), .Out_Of_Range)
 }
 
 // >------------------------------------------------------------------ Utilities
@@ -336,6 +406,12 @@ prefix :: proc(r: ^Json_Reader, name: string) {
 @(private = "file")
 open :: proc(r: ^Json_Reader, name: string, opener: byte, err: Json_Reader_Error) {
 	prefix(r, name)
+	enter(r, opener, err)
+}
+
+// open without the prefix, for when it was already consumed.
+@(private = "file")
+enter :: proc(r: ^Json_Reader, opener: byte, err: Json_Reader_Error) {
 	expect(r, opener, err)
 
 	r.depth += 1

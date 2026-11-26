@@ -5,6 +5,7 @@ import "core:math"
 import "core:reflect"
 import "core:strconv"
 import "core:strings"
+import "core:unicode/utf8"
 
 MAX_JSON_INLINE_ARRAY :: 4
 
@@ -43,6 +44,8 @@ json_writer_init :: proc(
 		string_begin = json_writer_string_begin,
 		string_end   = json_writer_string_end,
 		primitive    = json_writer_primitive,
+		union_begin  = json_writer_union_begin,
+		union_end    = json_writer_union_end,
 		allocator    = allocator,
 	}
 
@@ -195,11 +198,37 @@ json_writer_primitive :: proc(
 
 		write_key_aware(w, strconv.write_int(buffer[:], val, 10), key)
 
+	case runtime.Type_Info_Rune:
+		bytes, n := utf8.encode_rune((^rune)(data)^)
+		write_quoted(w, string(bytes[:n]))
+
 	case runtime.Type_Info_String:
 		// Only non UTF-8 strings land here, walk sends the rest to string_begin
 		write_key_aware(w, "null", key)
 	}
 }
+
+// Unions are an object with a single key naming the variant, `{"Circle": {...}}`, nil is
+// `null`.
+json_writer_union_begin :: proc(
+	v: ^Visitor,
+	name: string,
+	info: ^runtime.Type_Info,
+	variant: ^int,
+) -> bool {
+	w := (^Json_Writer)(v)
+
+	if variant^ < 0 {
+		prefix(w, name)
+		strings.write_string(&w.builder, "null")
+		return false
+	}
+
+	open(w, name, '{')
+	return true
+}
+
+json_writer_union_end :: proc(v: ^Visitor) {close((^Json_Writer)(v), '}')}
 
 json_writer_write_string :: proc(w: ^Json_Writer, name: string, s: string) {
 	prefix(w, name)
@@ -314,7 +343,10 @@ is_primitive :: proc(ti: ^runtime.Type_Info) -> bool {
 	     runtime.Type_Info_Array,
 	     runtime.Type_Info_Slice,
 	     runtime.Type_Info_Dynamic_Array,
-	     runtime.Type_Info_Map:
+	     runtime.Type_Info_Map,
+	     runtime.Type_Info_Bit_Set,
+	     runtime.Type_Info_Bit_Field,
+	     runtime.Type_Info_Union:
 		return false
 	}
 

@@ -64,3 +64,53 @@ json_writer_map_keys_and_nan :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, out, `{"m":{"5":true},"f":null}`)
 }
+
+@(test)
+json_writer_bits_and_unions :: proc(t: ^testing.T) {
+	Kind :: enum u8 {
+		Box,
+		Sphere,
+		Capsule,
+	}
+	Circle :: struct {
+		r: f32,
+	}
+	Shape :: union {
+		Circle,
+		int,
+	}
+	Flags :: bit_field u16 {
+		level: u8   | 4,
+		delta: i8   | 4,
+		kind:  Kind | 2,
+		on:    bool | 1,
+	}
+	Thing :: struct {
+		kinds:  bit_set[Kind],
+		digits: bit_set[0 ..< 10],
+		chars:  bit_set['a' ..= 'z'],
+		flags:  Flags,
+		a:      Shape,
+		b:      Shape,
+		c:      Shape,
+	}
+
+	thing := Thing {
+		kinds  = {.Box, .Capsule},
+		digits = {1, 9},
+		chars  = {'c'},
+		flags  = {level = 15, delta = -3, kind = .Sphere, on = true},
+		a      = Circle{0.5},
+		b      = 7,
+	}
+	out := shape.json_write(&thing)
+	defer delete(out)
+
+	testing.expect_value(
+		t,
+		out,
+		`{"kinds":["Box","Capsule"],"digits":[1,9],"chars":["c"],` +
+		`"flags":{"level":15,"delta":-3,"kind":"Sphere","on":true},` +
+		`"a":{"Circle":{"r":0.5}},"b":{"int":7},"c":null}`,
+	)
+}
