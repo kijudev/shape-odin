@@ -60,29 +60,7 @@ main :: proc() {
 
 	entity := create_entity(123, "Test Entity")
 
-	lisp_roundtrip(&entity)
 	json_roundtrip(&entity)
-}
-
-lisp_roundtrip :: proc(entity: ^Entity) {
-	reader: shape.Lisp_Reader
-	shape.lisp_reader_init(&reader, 64 * 1024, pretty = true, tabsize = 4)
-
-	shape.walk(&reader, "entity", entity, Entity)
-	serialized := shape.lisp_reader_string(&reader)
-	fmt.println("Lisp serialized:", serialized)
-
-	deserialized: Entity
-	writer: shape.Lisp_Writer
-	shape.lisp_writer_init(&writer, serialized)
-	shape.walk(&writer, "entity", &deserialized, Entity)
-
-	if writer.err != .None {
-		fmt.println("Lisp deserialization failed:", writer.err, "at", writer.pos)
-		return
-	}
-
-	report("Lisp", entities_equal(entity, &deserialized))
 }
 
 json_roundtrip :: proc(entity: ^Entity) {
