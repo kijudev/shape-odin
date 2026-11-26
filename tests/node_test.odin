@@ -17,30 +17,31 @@ node_struct_fields :: proc(t: ^testing.T) {
 
 	thing := Thing{1, 2, "b", nil}
 	root := shape.node_of(&thing)
+	s, is_struct := root.value.(shape.Struct)
 
-	testing.expect_value(t, root.kind, shape.Kind.Struct)
+	testing.expect(t, is_struct)
 	testing.expect_value(t, root.index, -1)
-	testing.expect_value(t, shape.field_count(root), 4)
+	testing.expect_value(t, s.count, 4)
 
 	names: [dynamic]string
 	defer delete(names)
 
 	it := 0
-	for f in shape.iterate_fields(root, &it) do append(&names, f.name)
+	for f in shape.iterate_fields(s, &it) do append(&names, f.name)
 	testing.expect_value(t, len(names), 3)
 	testing.expect_value(t, names[1], "b")
 
-	b := shape.field(root, 2)
+	b := shape.field(s, 2)
 	testing.expect_value(t, b.index, 2)
 	testing.expect_value(t, b.tag, `meta:"x"`)
-	testing.expect_value(t, shape.get_string(b), "b")
-	testing.expect_value(t, shape.field(root, 3).kind, shape.Kind.Invalid)
-	testing.expect_value(t, shape.field(root, 9).kind, shape.Kind.Invalid)
+	testing.expect_value(t, shape.get_string(b.value.(shape.String)), "b")
+	testing.expect(t, shape.field(s, 3).value == nil)
+	testing.expect(t, shape.field(s, 9).value == nil)
 
-	shape.set_int(shape.field(root, 0), 42)
+	shape.set_int(shape.field(s, 0).value.(shape.Int), 42)
 	testing.expect_value(t, thing.a, 42)
 
-	shape.set_string(b, "changed", context.temp_allocator)
+	shape.set_string(b.value.(shape.String), "changed", context.temp_allocator)
 	testing.expect_value(t, thing.b, "changed")
 }
 
@@ -57,11 +58,16 @@ node_scalars :: proc(t: ^testing.T) {
 		kind:  Kind,
 		f:     f16,
 		c:     cstring,
+		r:     rune,
+		on:    b32,
 	}
 
 	thing: Thing
-	root := shape.node_of(&thing)
-	small, big, be := shape.field(root, 0), shape.field(root, 1), shape.field(root, 2)
+	s := shape.node_of(&thing).value.(shape.Struct)
+	small := shape.field(s, 0).value.(shape.Int)
+	big := shape.field(s, 1).value.(shape.Int)
+	be := shape.field(s, 2).value.(shape.Int)
+	kind := shape.field(s, 3).value.(shape.Enum)
 
 	testing.expect(t, shape.set_int(small, -128))
 	testing.expect(t, !shape.set_int(small, 128))
@@ -71,20 +77,29 @@ node_scalars :: proc(t: ^testing.T) {
 	testing.expect(t, shape.set_int(big, -1))
 	testing.expect_value(t, thing.big, max(u128))
 
+	testing.expect(t, be.swapped)
 	testing.expect(t, shape.set_int(be, 0x01020304))
 	testing.expect_value(t, thing.be, 0x01020304)
 	testing.expect_value(t, shape.get_int(be), 0x01020304)
 
-	testing.expect(t, !shape.set_int(shape.field(root, 3), 256))
-	name, ok := shape.enum_name(shape.field(root, 3).info, 1)
+	testing.expect(t, !shape.set_enum(kind, 256))
+	testing.expect(t, shape.set_enum(kind, 1))
+	testing.expect_value(t, thing.kind, Kind.Capsule)
+	name, ok := shape.enum_name(kind, 1)
 	testing.expect(t, ok)
 	testing.expect_value(t, name, "Capsule")
 
-	shape.set_float(shape.field(root, 4), 0.5)
+	shape.set_float(shape.field(s, 4).value.(shape.Float), 0.5)
 	testing.expect_value(t, thing.f, 0.5)
 
-	shape.set_string(shape.field(root, 5), "c", context.temp_allocator)
+	shape.set_string(shape.field(s, 5).value.(shape.String), "c", context.temp_allocator)
 	testing.expect_value(t, thing.c, "c")
+
+	testing.expect(t, shape.set_rune(shape.field(s, 6).value.(shape.Rune), 'é'))
+	testing.expect_value(t, thing.r, 'é')
+
+	shape.set_bool(shape.field(s, 7).value.(shape.Bool), true)
+	testing.expect_value(t, thing.on, true)
 
 	// Full range integers and the other byte order survive JSON
 	out := shape.json_write(&thing)
@@ -117,11 +132,13 @@ node_bits :: proc(t: ^testing.T) {
 	thing := Thing {
 		flags = {level = 3, delta = -2, kind = .Sphere},
 	}
-	root := shape.node_of(&thing)
-	flags, kinds := shape.field(root, 0), shape.field(root, 1)
+	s := shape.node_of(&thing).value.(shape.Struct)
+	flags, is_struct := shape.field(s, 0).value.(shape.Struct)
+	kinds := shape.field(s, 1).value.(shape.Bit_Set)
 
-	testing.expect_value(t, flags.kind, shape.Kind.Struct)
-	delta := shape.field(flags, 1)
+	testing.expect(t, is_struct)
+	testing.expect(t, flags.packed)
+	delta := shape.field(flags, 1).value.(shape.Int)
 	testing.expect_value(t, shape.get_int(delta), -2)
 	testing.expect(t, !shape.set_int(delta, 8))
 	testing.expect(t, shape.set_int(delta, -8))
@@ -129,15 +146,16 @@ node_bits :: proc(t: ^testing.T) {
 	// Neighbours keep their bits
 	testing.expect_value(t, thing.flags.level, 3)
 	testing.expect_value(t, thing.flags.kind, Kind.Sphere)
+	testing.expect(t, shape.set_enum(shape.field(flags, 2).value.(shape.Enum), 2))
+	testing.expect_value(t, thing.flags.kind, Kind.Capsule)
 
 	testing.expect_value(t, shape.length(kinds), 3)
-	capsule := shape.elem(kinds, 2)
-	testing.expect_value(t, capsule.kind, shape.Kind.Bool)
+	capsule := shape.member(kinds, 2)
 	testing.expect_value(t, capsule.name, "Capsule")
-	shape.set_bool(capsule, true)
+	shape.set_bool(capsule.value.(shape.Bool), true)
 	testing.expect_value(t, thing.kinds, bit_set[Kind]{.Capsule})
-	testing.expect(t, shape.get_bool(capsule))
-	testing.expect_value(t, shape.elem(kinds, 3).kind, shape.Kind.Invalid)
+	testing.expect(t, shape.get_bool(capsule.value.(shape.Bool)))
+	testing.expect(t, shape.member(kinds, 3).value == nil)
 }
 
 @(test)
@@ -155,22 +173,30 @@ node_arrays :: proc(t: ^testing.T) {
 
 	thing: Thing
 	thing.dyn.allocator = context.temp_allocator
-	root := shape.node_of(&thing)
-	dyn, sl, fixed, named := shape.field(root, 0), shape.field(root, 1), shape.field(root, 2), shape.field(root, 3)
+	s := shape.node_of(&thing).value.(shape.Struct)
+	dyn := shape.field(s, 0).value.(shape.Array)
+	sl := shape.field(s, 1).value.(shape.Array)
+	fixed := shape.field(s, 2).value.(shape.Array)
+	named := shape.field(s, 3).value.(shape.Array)
+
+	set :: proc(a: shape.Array, i: int, value: i128) {
+		shape.set_int(shape.elem(a, i).value.(shape.Int), value)
+	}
 
 	testing.expect(t, shape.resize(dyn, 2))
-	shape.set_int(shape.elem(dyn, 0), 1)
-	shape.set_int(shape.elem(dyn, 1), 3)
+	set(dyn, 0, 1)
+	set(dyn, 1, 3)
 	testing.expect(t, shape.insert_elem(dyn, 1))
-	shape.set_int(shape.elem(dyn, 1), 2)
+	set(dyn, 1, 2)
 	testing.expect_value(t, len(thing.dyn), 3)
 	testing.expect_value(t, thing.dyn[2], 3)
 	testing.expect(t, shape.remove_elem(dyn, 0))
 	testing.expect_value(t, thing.dyn[0], 2)
 	testing.expect_value(t, len(thing.dyn), 2)
+	testing.expect(t, shape.elem(dyn, 2).value == nil)
 
 	testing.expect(t, shape.resize(sl, 2, context.temp_allocator))
-	shape.set_int(shape.elem(sl, 1), 7)
+	set(sl, 1, 7)
 	testing.expect(t, shape.resize(sl, 3, context.temp_allocator))
 	testing.expect_value(t, thing.sl[1], 7)
 	testing.expect_value(t, thing.sl[2], 0)
@@ -182,8 +208,9 @@ node_arrays :: proc(t: ^testing.T) {
 
 	testing.expect(t, !shape.is_resizable(named))
 	testing.expect_value(t, shape.length(named), 2)
-	testing.expect_value(t, shape.elem(named, 1).name, "Capsule")
-	shape.set_float(shape.elem(named, 1), 2.5)
+	capsule := shape.elem(named, 1)
+	testing.expect_value(t, capsule.name, "Capsule")
+	shape.set_float(capsule.value.(shape.Float), 2.5)
 	testing.expect_value(t, thing.named[.Capsule], 2.5)
 
 	out := shape.json_write(&thing)
@@ -208,32 +235,32 @@ node_maps :: proc(t: ^testing.T) {
 	scores["a"] = 1
 	scores["b"] = 2
 
-	root := shape.node_of(&scores)
-	testing.expect_value(t, shape.length(root), 2)
+	m := shape.node_of(&scores).value.(shape.Map)
+	testing.expect_value(t, shape.length(m), 2)
 
 	sum, keys := 0, 0
 	it := 0
-	for key, value in shape.iterate_map(root, &it) {
+	for key, value in shape.iterate_map(m, &it) {
 		testing.expect(t, key.is_key)
 		testing.expect_value(t, key.index, value.index)
-		sum += int(shape.get_int(value))
+		sum += int(shape.get_int(value.value.(shape.Int)))
 		keys += 1
 	}
 	testing.expect_value(t, sum, 3)
 	testing.expect_value(t, keys, 2)
 
 	key := "c"
-	stored := shape.map_insert(root, &key, nil)
-	testing.expect_value(t, stored.kind, shape.Kind.Int)
+	stored, is_int := shape.map_insert(m, &key, nil).value.(shape.Int)
+	testing.expect(t, is_int)
 	shape.set_int(stored, 5)
 	testing.expect_value(t, scores["c"], 5)
 
-	found, ok := shape.map_find(root, &key)
+	found, ok := shape.map_find(m, &key)
 	testing.expect(t, ok)
-	testing.expect_value(t, shape.get_int(found), 5)
+	testing.expect_value(t, shape.get_int(found.value.(shape.Int)), 5)
 
-	testing.expect(t, shape.map_remove(root, &key))
-	testing.expect(t, !shape.map_remove(root, &key))
+	testing.expect(t, shape.map_remove(m, &key))
+	testing.expect(t, !shape.map_remove(m, &key))
 	testing.expect_value(t, len(scores), 2)
 }
 
@@ -256,22 +283,23 @@ node_unions :: proc(t: ^testing.T) {
 	}
 
 	thing := Thing{Circle{1}, 5}
-	root := shape.node_of(&thing)
-	s, strict := shape.field(root, 0), shape.field(root, 1)
+	root := shape.node_of(&thing).value.(shape.Struct)
+	s := shape.field(root, 0).value.(shape.Union)
+	strict := shape.field(root, 1).value.(shape.Union)
 
 	index, payload := shape.variant(s)
 	testing.expect_value(t, index, 0)
-	testing.expect_value(t, payload.name, "s")
-	testing.expect_value(t, payload.kind, shape.Kind.Struct)
-	testing.expect(t, shape.allows_nil(s))
+	_, is_struct := payload.value.(shape.Struct)
+	testing.expect(t, is_struct)
+	testing.expect(t, !s.no_nil)
 
 	buffer: [64]byte
-	testing.expect_value(t, shape.variant_count(s), 2)
+	testing.expect_value(t, len(s.variants), 2)
 	testing.expect_value(t, shape.variant_name(s, 0, buffer[:]), "Circle")
 	testing.expect_value(t, shape.variant_name(s, 1, buffer[:]), "int")
 
 	payload, _ = shape.set_variant(s, 1)
-	shape.set_int(payload, 9)
+	shape.set_int(payload.value.(shape.Int), 9)
 	testing.expect_value(t, thing.s.(int), 9)
 
 	_, ok := shape.set_variant(s, -1)
@@ -279,9 +307,9 @@ node_unions :: proc(t: ^testing.T) {
 	testing.expect(t, thing.s == nil)
 	index, payload = shape.variant(s)
 	testing.expect_value(t, index, -1)
-	testing.expect_value(t, payload.kind, shape.Kind.Invalid)
+	testing.expect(t, payload.value == nil)
 
-	testing.expect(t, !shape.allows_nil(strict))
+	testing.expect(t, strict.no_nil)
 	_, ok = shape.set_variant(strict, -1)
 	testing.expect(t, !ok)
 	_, ok = shape.set_variant(strict, 2)
@@ -364,7 +392,7 @@ json_overrides :: proc(t: ^testing.T) {
 	write_percent :: proc(w: ^shape.Json_Writer, n: shape.Node) -> bool {
 		if reflect.struct_tag_get(n.tag, "json") != "percent" do return false
 
-		percent := int(shape.get_float(n) * 100)
+		percent := int(shape.get_float(n.value.(shape.Float)) * 100)
 		shape.json_write_node(w, shape.node_of(&percent))
 		return true
 	}

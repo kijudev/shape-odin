@@ -73,50 +73,50 @@ json_write :: proc(
 json_write_node :: proc(w: ^Json_Writer, n: Node) {
 	if w.override != nil && w.override(w, n) do return
 
-	switch n.kind {
-	case .Struct:
+	switch v in n.value {
+	case Struct:
 		first := true
 		open(w, '{')
 		it := 0
-		for f in iterate_fields(n, &it) {
+		for f in iterate_fields(v, &it) {
 			item(w, &first, false)
 			write_name(w, f.name)
 			json_write_node(w, f)
 		}
 		close(w, '}', first, false)
 
-	case .Array:
-		count := length(n)
-		inline := count <= MAX_JSON_INLINE_ARRAY && count > 0 && is_primitive(elem(n, 0).kind)
+	case Array:
+		count := array_length(v)
+		inline := count <= MAX_JSON_INLINE_ARRAY && count > 0 && is_primitive(elem(v, 0).value)
 
 		first := true
 		open(w, '[')
-		for i in 0 ..< count {
+		it: Elem_Iterator
+		for e in iterate_elems(v, &it) {
 			item(w, &first, inline)
-			json_write_node(w, elem(n, i))
+			json_write_node(w, e)
 		}
 		close(w, ']', first, inline)
 
-	case .Bit_Set:
-		bits := load_bits(n.data, n.info.size)
+	case Bit_Set:
+		bits := load_bits(v.data, int(v.size))
 		inline := count_ones(bits) <= MAX_JSON_INLINE_ARRAY
-		elem_info, lower := bit_set_elem(n)
 
 		first := true
 		open(w, '[')
 		for rest := bits; rest != 0; rest &= rest - 1 {
 			item(w, &first, inline)
 			// Members go out as values of the element type, so enums get their names
-			member := u128(lower + i128(lowest_one(rest)))
-			json_write_node(w, node_from(&member, elem_info))
+			member := u128(i128(v.lower) + i128(lowest_one(rest)))
+			json_write_node(w, node_from(&member, v.elem))
 		}
 		close(w, ']', first, inline)
 
-	case .Map:
+	case Map:
 		first := true
 		open(w, '{')
 		it := 0
-		for key, value in iterate_map(n, &it) {
+		for key, value in iterate_map(v, &it) {
 			item(w, &first, false)
 			write_key(w, key)
 			strings.write_string(&w.builder, w.pretty ? ": " : ":")
@@ -124,8 +124,8 @@ json_write_node :: proc(w: ^Json_Writer, n: Node) {
 		}
 		close(w, '}', first, false)
 
-	case .Union:
-		index, payload := variant(n)
+	case Union:
+		index, payload := variant(v)
 		if index < 0 {
 			strings.write_string(&w.builder, "null")
 			return
@@ -135,17 +135,17 @@ json_write_node :: proc(w: ^Json_Writer, n: Node) {
 		first := true
 		open(w, '{')
 		item(w, &first, false)
-		write_name(w, variant_name(n, index, buffer[:]))
+		write_name(w, variant_name(v, index, buffer[:]))
 		json_write_node(w, payload)
 		close(w, '}', first, false)
 
-	case .String:
-		write_quoted(w, get_string(n))
+	case String:
+		write_quoted(w, get_string(v))
 
-	case .Int, .Float, .Bool, .Rune, .Enum:
-		write_scalar(w, n, false)
+	case Int, Float, Bool, Rune, Enum:
+		write_scalar(w, n.value, false)
 
-	case .Invalid:
+	case:
 		strings.write_string(&w.builder, "null")
 	}
 }
@@ -155,45 +155,45 @@ json_write_node :: proc(w: ^Json_Writer, n: Node) {
 // Object keys must be strings in JSON, so a primitive map key is wrapped in quotes.
 @(private = "file")
 write_key :: proc(w: ^Json_Writer, key: Node) {
-	#partial switch key.kind {
-	case .Int, .Float, .Bool, .Rune, .Enum:
-		write_scalar(w, key, true)
+	#partial switch _ in key.value {
+	case Int, Float, Bool, Rune, Enum:
+		write_scalar(w, key.value, true)
 	case:
 		json_write_node(w, key)
 	}
 }
 
 @(private = "file")
-write_scalar :: proc(w: ^Json_Writer, n: Node, key: bool) {
+write_scalar :: proc(w: ^Json_Writer, value: Value, key: bool) {
 	buffer: [64]byte
 
-	#partial switch n.kind {
-	case .Int:
-		write_key_aware(w, format_int(buffer[:], get_int(n), n.signed), key)
+	#partial switch v in value {
+	case Int:
+		write_key_aware(w, format_int(buffer[:], get_int(v), v.signed), key)
 
-	case .Float:
-		f := get_float(n)
+	case Float:
+		f := get_float(v)
 
 		if math.is_nan(f) || math.is_inf(f) {
 			write_key_aware(w, "null", key)
 		} else {
-			s := strconv.write_float(buffer[:], f, 'g', -1, n.info.size * 8)
+			s := strconv.write_float(buffer[:], f, 'g', -1, int(v.size) * 8)
 			write_key_aware(w, strings.trim_prefix(s, "+"), key)
 		}
 
-	case .Bool:
-		write_key_aware(w, get_bool(n) ? "true" : "false", key)
+	case Bool:
+		write_key_aware(w, get_bool(v) ? "true" : "false", key)
 
-	case .Enum:
-		value := get_int(n)
-		if name, ok := enum_name(n.info, value); ok {
+	case Enum:
+		value := get_enum(v)
+		if name, ok := enum_name(v, value); ok {
 			write_quoted(w, name)
 		} else {
-			write_key_aware(w, format_int(buffer[:], value, n.signed), key)
+			write_key_aware(w, format_int(buffer[:], value, v.signed), key)
 		}
 
-	case .Rune:
-		bytes, length := utf8.encode_rune(rune(get_int(n)))
+	case Rune:
+		bytes, length := utf8.encode_rune(get_rune(v))
 		write_quoted(w, string(bytes[:length]))
 	}
 }
@@ -290,9 +290,9 @@ close :: proc(w: ^Json_Writer, closer: byte, first: bool, inline: bool) {
 }
 
 @(private = "file")
-is_primitive :: proc(kind: Kind) -> bool {
-	#partial switch kind {
-	case .Struct, .Array, .Map, .Bit_Set, .Union:
+is_primitive :: proc(value: Value) -> bool {
+	#partial switch _ in value {
+	case Struct, Array, Map, Bit_Set, Union:
 		return false
 	}
 

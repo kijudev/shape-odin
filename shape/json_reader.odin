@@ -69,12 +69,12 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 	if r.err != .None do return
 	if r.override != nil && r.override(r, n) do return
 
-	switch n.kind {
-	case .Struct:
+	switch v in n.value {
+	case Struct:
 		expect(r, '{', .Parse_Struct)
 		first := true
 		it := 0
-		for f in iterate_fields(n, &it) {
+		for f in iterate_fields(v, &it) {
 			if !first do expect(r, ',', .Parse_Separator)
 			first = false
 
@@ -85,56 +85,56 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 		}
 		expect(r, '}', .Parse_Struct)
 
-	case .Array:
+	case Array:
 		if !expect(r, '[', .Parse_Array) do return
 		count := count_items(r)
 
-		fits := is_resizable(n) ? resize(n, count, r.allocator) : count == length(n)
+		fits := is_resizable(v) ? resize(v, count, r.allocator) : count == array_length(v)
 		if !fits {
 			fail(r, .Parse_Array)
 			return
 		}
 
-		for i in 0 ..< count {
-			if i > 0 do expect(r, ',', .Parse_Separator)
-			json_read_node(r, elem(n, i))
+		it: Elem_Iterator
+		for e in iterate_elems(v, &it) {
+			if e.index > 0 do expect(r, ',', .Parse_Separator)
+			json_read_node(r, e)
 			if r.err != .None do return
 		}
 		expect(r, ']', .Parse_Array)
 
-	case .Bit_Set:
+	case Bit_Set:
 		if !expect(r, '[', .Parse_Array) do return
 		count := count_items(r)
-		elem_info, lower := bit_set_elem(n)
-		store_bits(n.data, n.info.size, 0)
+		store_bits(v.data, int(v.size), 0)
 
 		for i in 0 ..< count {
 			if i > 0 do expect(r, ',', .Parse_Separator)
 
 			// Members come as values of the element type, read through a scratch value
 			scratch: u128
-			value := node_from(&scratch, elem_info)
+			value := node_from(&scratch, v.elem)
 			json_read_node(r, value)
 			if r.err != .None do return
 
-			member := elem(n, int(get_int(value) - lower))
-			if member.kind == .Invalid {
+			m := member(v, int(integer_of(value.value) - i128(v.lower)))
+			flag, ok := m.value.(Bool)
+			if !ok {
 				fail(r, .Out_Of_Range)
 				return
 			}
-			set_bool(member, true)
+			set_bool(flag, true)
 		}
 		expect(r, ']', .Parse_Array)
 
-	case .Map:
+	case Map:
 		if !expect(r, '{', .Parse_Map) do return
 		count := count_items(r)
-		info := runtime.type_info_base(n.info).variant.(runtime.Type_Info_Map)
-		map_reserve(n, count, r.allocator)
+		map_reserve(v, count, r.allocator)
 
 		// Entries are read into scratch values and copied in, the map hashes the finished key
-		key_mem, _ := runtime.mem_alloc(info.key.size, info.key.align, r.allocator)
-		value_mem, _ := runtime.mem_alloc(info.value.size, info.value.align, r.allocator)
+		key_mem, _ := runtime.mem_alloc(v.key.size, v.key.align, r.allocator)
+		value_mem, _ := runtime.mem_alloc(v.value.size, v.value.align, r.allocator)
 		defer runtime.mem_free(raw_data(key_mem), r.allocator)
 		defer runtime.mem_free(raw_data(value_mem), r.allocator)
 
@@ -143,22 +143,22 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 			runtime.mem_zero(raw_data(key_mem), len(key_mem))
 			runtime.mem_zero(raw_data(value_mem), len(value_mem))
 
-			key := node_from(raw_data(key_mem), info.key)
+			key := node_from(raw_data(key_mem), v.key)
 			key.is_key = true
 			read_key(r, key)
 			expect(r, ':', .Parse_Separator)
-			json_read_node(r, node_from(raw_data(value_mem), info.value))
+			json_read_node(r, node_from(raw_data(value_mem), v.value))
 			if r.err != .None do return
 
-			map_insert(n, raw_data(key_mem), raw_data(value_mem), r.allocator)
+			map_insert(v, raw_data(key_mem), raw_data(value_mem), r.allocator)
 		}
 		expect(r, '}', .Parse_Map)
 
-	case .Union:
+	case Union:
 		if !skip_ws(r) do return
 
 		if r.pos >= len(r.src) || r.src[r.pos] != '{' {
-			_, ok := set_variant(n, -1)
+			_, ok := set_variant(v, -1)
 			if token(r) != "null" || !ok do fail(r, .Parse_Union)
 			return
 		}
@@ -168,10 +168,10 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 		if r.err != .None do return
 
 		buffer: [128]byte
-		for i in 0 ..< variant_count(n) {
-			if variant_name(n, i, buffer[:]) != key do continue
+		for i in 0 ..< len(v.variants) {
+			if variant_name(v, i, buffer[:]) != key do continue
 
-			payload, _ := set_variant(n, i)
+			payload, _ := set_variant(v, i)
 			expect(r, ':', .Parse_Separator)
 			json_read_node(r, payload)
 			expect(r, '}', .Parse_Union)
@@ -180,7 +180,7 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 
 		fail(r, .Parse_Union)
 
-	case .String:
+	case String:
 		if !expect(r, '"', .Parse_String) do return
 
 		length, _, ok := decode_string(r.src, r.pos, nil)
@@ -189,12 +189,12 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 			return
 		}
 
-		_, r.pos, _ = decode_string(r.src, r.pos, alloc_string(n, length, r.allocator))
+		_, r.pos, _ = decode_string(r.src, r.pos, alloc_string(v, length, r.allocator))
 
-	case .Int, .Float, .Bool, .Rune, .Enum:
-		read_scalar(r, n, false)
+	case Int, Float, Bool, Rune, Enum:
+		read_scalar(r, n.value, false)
 
-	case .Invalid:
+	case:
 		if token(r) != "null" do fail(r, .Parse_Null)
 	}
 }
@@ -204,38 +204,58 @@ json_read_node :: proc(r: ^Json_Reader, n: Node) {
 // A primitive map key arrives wrapped in quotes.
 @(private = "file")
 read_key :: proc(r: ^Json_Reader, key: Node) {
-	#partial switch key.kind {
-	case .Int, .Float, .Bool, .Rune, .Enum:
-		read_scalar(r, key, true)
+	#partial switch _ in key.value {
+	case Int, Float, Bool, Rune, Enum:
+		read_scalar(r, key.value, true)
 	case:
 		json_read_node(r, key)
 	}
 }
 
 @(private = "file")
-read_scalar :: proc(r: ^Json_Reader, n: Node, key: bool) {
-	value: i128
+read_scalar :: proc(r: ^Json_Reader, value: Value, key: bool) {
+	fits := true
 
-	#partial switch n.kind {
-	case .Int:
-		value = n.signed ? parse_signed_int(r, key) : parse_unsigned_int(r, key)
+	#partial switch v in value {
+	case Int:
+		parsed := v.signed ? parse_signed_int(r, key) : parse_unsigned_int(r, key)
+		fits = r.err != .None || set_int(v, parsed)
 
-	case .Float:
+	case Float:
 		f := parse_float(r, key)
-		if r.err == .None do set_float(n, f)
-		return
+		if r.err == .None do set_float(v, f)
 
-	case .Bool:
-		value = parse_bool(r, key) ? 1 : 0
+	case Bool:
+		b := parse_bool(r, key)
+		if r.err == .None do set_bool(v, b)
 
-	case .Enum:
-		value = parse_enum(r, n.info)
+	case Enum:
+		parsed := parse_enum(r, v)
+		fits = r.err != .None || set_enum(v, parsed)
 
-	case .Rune:
-		value = i128(parse_rune(r))
+	case Rune:
+		parsed := parse_rune(r)
+		fits = r.err != .None || set_rune(v, parsed)
 	}
 
-	if r.err == .None && !set_int(n, value) do fail(r, .Out_Of_Range)
+	if !fits do fail(r, .Out_Of_Range)
+}
+
+// Integer like values (bit set members) as one number.
+@(private = "file")
+integer_of :: proc(value: Value) -> i128 {
+	#partial switch v in value {
+	case Int:
+		return get_int(v)
+	case Enum:
+		return get_enum(v)
+	case Rune:
+		return i128(get_rune(v))
+	case Bool:
+		return get_bool(v) ? 1 : 0
+	}
+
+	return 0
 }
 
 // A string holding exactly one code point.
@@ -422,14 +442,14 @@ parse_bool :: proc(r: ^Json_Reader, key: bool) -> bool {
 // Enums are names in quotes, or bare integers when the value has no named member. As a map
 // key the integer is quoted too, so a quoted integer is accepted as well.
 @(private = "file")
-parse_enum :: proc(r: ^Json_Reader, info: ^runtime.Type_Info) -> i128 {
+parse_enum :: proc(r: ^Json_Reader, e: Enum) -> i128 {
 	if !skip_ws(r) do return 0
 
 	tok: string
 	if r.pos < len(r.src) && r.src[r.pos] == '"' {
 		tok = quoted(r, .Parse_Enum)
 		if r.err != .None do return 0
-		if value, ok := enum_value(info, tok); ok do return value
+		if value, ok := enum_value(e, tok); ok do return value
 	} else {
 		tok = token(r)
 	}
